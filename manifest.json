@@ -1,0 +1,10 @@
+{
+	"id": "just-press-record-sync",
+	"name": "Just Press Record Sync",
+	"version": "1.0.0",
+	"minAppVersion": "1.4.0",
+	"description": "Creates notes from Just Press Record voice recordings.",
+	"author": "famibo",
+	"authorUrl": "https://obsidian.md",
+	"isDesktopOnly": true
+}
