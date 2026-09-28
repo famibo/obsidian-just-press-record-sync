@@ -12,8 +12,9 @@ import { promises as fs } from "fs";
 import * as path from "path";
 import { pathToFileURL } from "url";
 import { execFile } from "child_process";
-import { createHash } from "crypto";
 import { extractJprTranscriptFromFile } from "./jpr";
+import { mergeJprNoteIntoDailyNote } from "./dailyNoteSync";
+import { RecBlock, escapeAttr, hashOf, parseRecBlocks } from "./recBlocks";
 
 type LinkMode = "none" | "file-url" | "embed-copy";
 
@@ -41,6 +42,9 @@ const DEFAULT_SETTINGS: JprSettings = {
 // each run. Anything you write outside them is never touched.
 const START = "<!-- jpr:start -->";
 const END = "<!-- jpr:end -->";
+
+// Heading in the daily note under which "Add to daily note" merges transcriptions.
+const DAILY_NOTE_HEADING = "Voice notes";
 
 interface Recording {
 	file: string;
@@ -75,6 +79,39 @@ export default class JustPressRecordSyncPlugin extends Plugin {
 			this.app.workspace.onLayoutReady(() =>
 				this.run(this.settings.lookbackDays)
 			);
+		}
+
+		this.registerEvent(
+			this.app.workspace.on("file-menu", (menu, file) => {
+				if (!(file instanceof TFile) || !this.isJprNote(file)) return;
+				menu.addItem((item) =>
+					item
+						.setTitle("Add to daily note")
+						.setIcon("calendar-plus")
+						.onClick(() => this.addToDailyNote(file))
+				);
+			})
+		);
+	}
+
+	/** True for a note this plugin generated: a `YYYY-MM-DD.md` file directly inside the JPR vault folder. */
+	private isJprNote(file: TFile): boolean {
+		if (file.extension !== "md") return false;
+		if (normalizePath(file.parent?.path ?? "") !== normalizePath(this.settings.vaultFolder)) return false;
+		return moment(file.basename, "YYYY-MM-DD", true).isValid();
+	}
+
+	private async addToDailyNote(file: TFile) {
+		try {
+			const { added } = await mergeJprNoteIntoDailyNote(this.app, file, DAILY_NOTE_HEADING);
+			new Notice(
+				added
+					? `Added ${added} transcription(s) to the daily note.`
+					: "Just Press Record Sync: nothing new to add."
+			);
+		} catch (e) {
+			console.error(e);
+			new Notice(e instanceof Error ? e.message : String(e));
 		}
 	}
 
@@ -269,34 +306,6 @@ function renderTemplate(tpl: string, date: string, block: string): string {
 		return out.replace(/{{\s*transcriptions\s*}}/, () => block);
 	}
 	return `${out.trimEnd()}\n\n${block}\n`;
-}
-
-interface RecBlock {
-	hash: string;
-	body: string;
-}
-
-function hashOf(s: string): string {
-	return createHash("sha256").update(s).digest("hex").slice(0, 16);
-}
-
-function escapeAttr(s: string): string {
-	return s.replace(/&/g, "&amp;").replace(/"/g, "&quot;");
-}
-
-function unescapeAttr(s: string): string {
-	return s.replace(/&quot;/g, "\"").replace(/&amp;/g, "&");
-}
-
-const REC_RE = /<!-- jpr:rec file="([^"]*)" hash="([0-9a-f]+)" -->\n([\s\S]*?)\n<!-- jpr:rec-end -->/g;
-
-/** Parses the individually tagged transcription blocks out of a note's content. */
-function parseRecBlocks(content: string): Map<string, RecBlock> {
-	const map = new Map<string, RecBlock>();
-	for (const m of content.matchAll(REC_RE)) {
-		map.set(unescapeAttr(m[1]!), { hash: m[2]!, body: m[3]! });
-	}
-	return map;
 }
 
 /** Replace the managed block, or append it if the note doesn't have one yet. */
