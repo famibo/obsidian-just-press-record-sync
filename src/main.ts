@@ -12,6 +12,7 @@ import { promises as fs } from "fs";
 import * as path from "path";
 import { pathToFileURL } from "url";
 import { execFile } from "child_process";
+import { createHash } from "crypto";
 import { extractJprTranscriptFromFile } from "./jpr";
 
 type LinkMode = "none" | "file-url" | "embed-copy";
@@ -111,9 +112,11 @@ export default class JustPressRecordSyncPlugin extends Plugin {
 		const recordings = await this.collectRecordings(date);
 		if (recordings.length === 0) return false;
 
-		const block = await this.buildBlock(date, recordings);
 		const notePath = normalizePath(`${this.settings.vaultFolder}/${date}.md`);
 		const existing = this.app.vault.getAbstractFileByPath(notePath);
+		const existingContent = existing instanceof TFile ? await this.app.vault.cachedRead(existing) : undefined;
+
+		const block = await this.buildBlock(date, recordings, existingContent);
 
 		if (existing instanceof TFile) {
 			let changed = false;
@@ -163,12 +166,48 @@ export default class JustPressRecordSyncPlugin extends Plugin {
 		return out;
 	}
 
-	private async buildBlock(date: string, recs: Recording[]): Promise<string> {
-		const parts: string[] = [];
+	/**
+	 * Builds the day's managed block. Each transcription is individually tagged
+	 * with a content hash; if its current text in the note no longer matches
+	 * that hash, the user has edited it, so it's kept untouched instead of
+	 * being regenerated.
+	 */
+	private async buildBlock(date: string, recs: Recording[], existingContent: string | undefined): Promise<string> {
+		const existingRecs = existingContent ? parseRecBlocks(existingContent) : new Map<string, RecBlock>();
+		const consumed = new Set<string>();
+		const entries: { file: string; body: string; hash: string }[] = [];
+
 		for (const r of recs) {
-			const link = await this.linkFor(date, r);
-			parts.push(link ? `${r.text}\n\n${link}` : r.text);
+			consumed.add(r.file);
+			const existing = existingRecs.get(r.file);
+			const edited = existing !== undefined && hashOf(existing.body) !== existing.hash;
+
+			let body: string;
+			let hash: string;
+			if (edited) {
+				body = existing.body;
+				hash = existing.hash;
+			} else {
+				const link = await this.linkFor(date, r);
+				body = link ? `${r.text}\n\n${link}` : r.text;
+				hash = hashOf(body);
+			}
+			entries.push({ file: r.file, body, hash });
 		}
+
+		// Keep edited transcriptions even if their source recording is no
+		// longer found (e.g. moved or renamed) rather than silently dropping
+		// the edit.
+		for (const [file, rec] of existingRecs) {
+			if (consumed.has(file) || hashOf(rec.body) === rec.hash) continue;
+			entries.push({ file, body: rec.body, hash: rec.hash });
+		}
+
+		entries.sort((a, b) => a.file.localeCompare(b.file));
+
+		const parts = entries.map(
+			(e) => `<!-- jpr:rec file="${escapeAttr(e.file)}" hash="${e.hash}" -->\n${e.body}\n<!-- jpr:rec-end -->`
+		);
 		return `${START}\n${parts.join("\n\n")}\n${END}`;
 	}
 
@@ -230,6 +269,34 @@ function renderTemplate(tpl: string, date: string, block: string): string {
 		return out.replace(/{{\s*transcriptions\s*}}/, () => block);
 	}
 	return `${out.trimEnd()}\n\n${block}\n`;
+}
+
+interface RecBlock {
+	hash: string;
+	body: string;
+}
+
+function hashOf(s: string): string {
+	return createHash("sha256").update(s).digest("hex").slice(0, 16);
+}
+
+function escapeAttr(s: string): string {
+	return s.replace(/&/g, "&amp;").replace(/"/g, "&quot;");
+}
+
+function unescapeAttr(s: string): string {
+	return s.replace(/&quot;/g, "\"").replace(/&amp;/g, "&");
+}
+
+const REC_RE = /<!-- jpr:rec file="([^"]*)" hash="([0-9a-f]+)" -->\n([\s\S]*?)\n<!-- jpr:rec-end -->/g;
+
+/** Parses the individually tagged transcription blocks out of a note's content. */
+function parseRecBlocks(content: string): Map<string, RecBlock> {
+	const map = new Map<string, RecBlock>();
+	for (const m of content.matchAll(REC_RE)) {
+		map.set(unescapeAttr(m[1]!), { hash: m[2]!, body: m[3]! });
+	}
+	return map;
 }
 
 /** Replace the managed block, or append it if the note doesn't have one yet. */
